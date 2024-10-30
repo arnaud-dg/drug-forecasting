@@ -1,160 +1,129 @@
 import streamlit as st
-# Configuration de la page
 st.set_page_config(page_title="Sales Dashboard", layout="wide")
 
 import polars as pl
 import plotly.express as px
+import numpy as np
 from datetime import datetime
-# from src.helper import prepare_data, forecast_series, add_prediction_intervals, visualize_forecasts, evaluate_models, optimize_parameters
+from pathlib import Path
+from src.helper import prepare_plot_data, get_plot_title
 
-# Fonction pour charger et préparer les données
-@st.cache_data
+# Get the current directory
+directory = Path(__file__).resolve().parents[0]
+data_directory = directory/'data'
+
+@st.cache_data()
 def load_data():
+    """
+    Load and prepare data with caching
+    """
+    print("Loading data...")  # Pour débugger le cache
+    
     # Load the datasets
-    cip = pl.read_csv("data/CIP_list.csv", 
+    cip = pl.read_csv(str(data_directory) + "/CIP_list.csv", 
                     separator=";", 
                     truncate_ragged_lines=True, 
                     dtypes={"CIP13": pl.Utf8})
-    
-    # Supprimer la ligne cotenant la valeur 'Total' dans la colonne 'CIP13'
-    cip = cip.filter(pl.col('CIP13') != 'Total')
-    # Remplacer la valeur 'HomÃ©opathie' par 9999999999999 dans la colonne 'CIP13'
-    cip = cip.select(
-        pl.col('CIP13').str.replace("HomÃ©opathie ", "9999999999999").alias('CIP13')
-    )
 
-    sales = pl.read_csv("data/French_pharmaceutical_sales.csv", 
+    Value = pl.read_csv(str(data_directory) + "/French_pharmaceutical_sales.csv", 
                         separator=";", 
                         truncate_ragged_lines=True, 
                         dtypes={"CIP13": pl.Utf8})
     # Merge the datasets
-    df = sales.join(cip, on="CIP13", how="left")
-    # Convertir la colonne Date en datetime
+    df = Value.join(cip, on="CIP13", how="left")
     df = df.with_columns(
         pl.col('Date').str.strptime(pl.Date, format='%Y-%m-%d').alias('Date')
     )
-
-    df = df.filter(pl.col('Variable') == 'Reimbursement_Base')
-
-    # Affichage des colonnes et de leur type
-    print("Column names and data types:")
-    print(df.schema)
-
-    # Remplacer les valeurs nulles par "Non catégorisé"
-    df = df.with_columns([
-        pl.col('Level1').fill_null('Non catégorisé'),
-        pl.col('Level2').fill_null('Non catégorisé'),
-        pl.col('Level3').fill_null('Non catégorisé'),
-        pl.col('Product').fill_null('Non catégorisé')
-    ])
-
+    df = df.filter(pl.col('ATC2').is_not_null())
     return df
 
-# Chargement des données
+def get_unique_values_from_column(_df: pl.DataFrame, column: str) -> list:
+    """
+    Get unique values for a specific column from DataFrame
+    Using _df to indicate to Streamlit not to hash the DataFrame
+    """
+    return sorted(_df.select(column).unique().to_series().to_list())
+
+def create_hierarchy_filters(df):
+    """
+    Create hierarchical filters for the dashboard with auto-selection of single options
+    """
+    hierarchy_levels = [
+        ('ATC2', 'Sélectionner ATC2'),
+        ('ATC3', 'Sélectionner ATC3'),
+        ('ATC5', 'Sélectionner ATC5'),
+        ('Product', 'Sélectionner Produit'),
+        ('CIP13', 'Sélectionner CIP13')
+    ]
+    
+    filters = {}
+    filtered_df = df
+    
+    st.sidebar.title("Filtres")
+    
+    # Sélection du modèle de prévision
+    model_type = st.sidebar.selectbox(
+        "Modèle de prévision",
+        options=["statsforecast", "MLForecast", "HierarchicalForecast", "Seasonal decomposition"],
+        index=0,
+    )
+    filters['model_type'] = model_type
+    
+    st.sidebar.markdown("---")
+    
+    # Radio button pour Market_type
+    market_type = st.sidebar.radio(
+        "Type de Marché",
+        options=["Both", "Hospital", "Community"],
+        index=0,
+    )
+    
+    # Appliquer le filtre de Market_type si nécessaire
+    if market_type != "Both":
+        filtered_df = filtered_df.filter(pl.col("Market_type") == market_type)
+    filters['Market_type'] = market_type
+    
+    st.sidebar.markdown("---")
+    
+    # Parcourir chaque niveau de la hiérarchie
+    for level, label in hierarchy_levels:
+        if level == 'ATC2' or all(filters[prev] for prev, _ in hierarchy_levels[:hierarchy_levels.index((level, label))]):
+            options = get_unique_values_from_column(filtered_df, level)
+            
+            # Si une seule option est disponible, la sélectionner automatiquement
+            if len(options) == 1:
+                selected = options[0]
+                st.sidebar.selectbox(label, options=[selected], index=0, disabled=True)
+            else:
+                selected = st.sidebar.selectbox(
+                    label,
+                    options=[''] + options,
+                    index=0
+                )
+            
+            filters[level] = selected
+            
+            if selected:
+                filtered_df = filtered_df.filter(pl.col(level) == selected)
+            else:
+                break
+                
+    return filters
+
+# Main application
 df = load_data()
 
-# Enregistre le csv 
-df.write_csv('data/df.csv')
+# Create filters
+selected_filters = create_hierarchy_filters(df)
 
-# Affiche les colonnes et les types de données du dataframe
-# print("Column names and data types:")
-# print(df.schema)
-
-# Sidebar pour les filtres
-st.sidebar.title("Filtres")
-
-# Initialisation des variables de sélection
-selected_level1 = None
-selected_level2 = None
-selected_level3 = None
-selected_product = None
-selected_cip13 = None
-
-# Sélection Level 1
-all_level1 = sorted(df.select('Level1').unique().to_series().to_list())
-selected_level1 = st.sidebar.selectbox('Sélectionner Level 1', 
-                                     options=[''] + all_level1,
-                                     index=0)
-
-# Filtrage et affichage conditionnel des niveaux suivants
-if selected_level1:
-    # Filtrer les données pour Level 2
-    df_filtered = df.filter(pl.col('Level1') == selected_level1)
-    all_level2 = sorted(df_filtered.select('Level2').unique().to_series().to_list())
-    selected_level2 = st.sidebar.selectbox('Sélectionner Level 2',
-                                         options=[''] + all_level2,
-                                         index=0)
+# Create visualization if at least one filter is selected
+if any(val for key, val in selected_filters.items() if key not in ['Market_type', 'model_type']):
+    plot_data = prepare_plot_data(df, selected_filters)
     
-    if selected_level2:
-        # Filtrer les données pour Level 3
-        df_filtered = df_filtered.filter(pl.col('Level2') == selected_level2)
-        all_level3 = sorted(df_filtered.select('Level3').unique().to_series().to_list())
-        selected_level3 = st.sidebar.selectbox('Sélectionner Level 3',
-                                             options=[''] + all_level3,
-                                             index=0)
-        
-        if selected_level3:
-            # Filtrer les données pour Product
-            df_filtered = df_filtered.filter(pl.col('Level3') == selected_level3)
-            all_products = sorted(df_filtered.select('Product').unique().to_series().to_list())
-            selected_product = st.sidebar.selectbox('Sélectionner Produit',
-                                                  options=[''] + all_products,
-                                                  index=0)
-            
-            if selected_product:
-                # Filtrer les données pour CIP13
-                df_filtered = df_filtered.filter(pl.col('Product') == selected_product)
-                all_cip13 = sorted(df_filtered.select('CIP13').unique().to_series().to_list())
-                selected_cip13 = st.sidebar.selectbox('Sélectionner CIP13',
-                                                    options=[''] + all_cip13,
-                                                    index=0)
-
-# Préparation des données pour le graphique
-def prepare_plot_data(df, level1, level2=None, level3=None, product=None, cip13=None):
-    # Commencer avec le filtre Level1
-    filters = [pl.col('Level1') == level1]
-    
-    # Ajouter les autres filtres si nécessaire
-    if level2:
-        filters.append(pl.col('Level2') == level2)
-    if level3:
-        filters.append(pl.col('Level3') == level3)
-    if product:
-        filters.append(pl.col('Product') == product)
-    if cip13:
-        filters.append(pl.col('CIP13') == cip13)
-    
-    # Appliquer tous les filtres et agréger les données
-    plot_data = (df.filter(pl.all_horizontal(filters))
-                 .groupby('Date')
-                 .agg(pl.col('Sales').sum())
-                 .sort('Date'))
-    
-    # Convertir en DataFrame pandas pour Plotly
-    return plot_data.to_pandas()
-
-# Création du graphique
-if selected_level1:
-    plot_data = prepare_plot_data(df, selected_level1, selected_level2, 
-                                selected_level3, selected_product, selected_cip13)
-    
-    # Déterminer le titre du graphique
-    if selected_cip13:
-        title = f"Ventes pour CIP13: {selected_cip13}"
-    elif selected_product:
-        title = f"Ventes pour Produit: {selected_product}"
-    elif selected_level3:
-        title = f"Ventes pour Level 3: {selected_level3}"
-    elif selected_level2:
-        title = f"Ventes pour Level 2: {selected_level2}"
-    else:
-        title = f"Ventes pour Level 1: {selected_level1}"
-    
-    # Création du graphique avec Plotly
     fig = px.line(plot_data, 
                  x='Date', 
-                 y='Sales',
-                 title=title)
+                 y='Value',
+                 title=get_plot_title(selected_filters))
     
     fig.update_layout(
         xaxis_title="Date",
@@ -162,13 +131,11 @@ if selected_level1:
         hovermode='x unified'
     )
     
-    # Affichage du graphique
     st.plotly_chart(fig, use_container_width=True)
+    
+    # Statistics
+    with st.expander("Statistiques descriptives"):
+        stats_data = plot_data['Value'].describe()
+        st.write(stats_data)
 else:
     st.write("Veuillez sélectionner au moins un niveau de la hiérarchie pour afficher les données.")
-
-# Ajout d'informations supplémentaires
-if selected_level1:
-    with st.expander("Statistiques descriptives"):
-        stats_data = plot_data['Sales'].describe()
-        st.write(stats_data)
