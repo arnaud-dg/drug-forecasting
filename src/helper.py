@@ -15,13 +15,16 @@ def prepare_plot_data(_df: pl.DataFrame, filters: dict):
     """
     filtered_df = _df
     
+    # Liste des colonnes à exclure du filtrage
+    excluded_columns = ['Market_type', 'model_type', 'horizon']
+    
     # Appliquer le filtre de Market_type
     if filters['Market_type'] != "Both":
         filtered_df = filtered_df.filter(pl.col("Market_type") == filters['Market_type'])
     
     # Appliquer les autres filtres
     active_filters = [pl.col(col) == val for col, val in filters.items() 
-                     if val and col not in ['Market_type', 'model_type']]
+                     if val and col not in excluded_columns and col in _df.columns]
     
     if not active_filters:
         return None
@@ -49,3 +52,72 @@ def get_plot_title(filters):
         if filters.get(level):
             return f"Ventes pour {level}: {filters[level]}{market_type_text}{model_text}"
     return "Veuillez sélectionner au moins un niveau de la hiérarchie"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
