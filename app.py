@@ -101,6 +101,9 @@ def create_hierarchy_filters(df: pl.DataFrame) -> dict:
     
     filters = {}
     filtered_df = df
+
+    # Load the icon of the webapp
+    st.sidebar.image(str(DIRECTORY/'assets'/'drug_sales_forecasting_icone.png'), width=250)
     
     st.sidebar.title("Filters")
     
