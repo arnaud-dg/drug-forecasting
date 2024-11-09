@@ -19,8 +19,19 @@ import polars as pl
 import plotly.express as px
 from pathlib import Path
 from datetime import datetime
-from src.visualization import prepare_plot_data, generate_plot_title, PlotSettings, display_simple_viewer, display_seasonal_decomposition, display_forecast_view
-from src.forecasting import ForecastModelManager, calculate_forecast_statistics
+from src.visualization import display_simple_viewer, display_seasonal_decomposition, create_combined_forecast_plot, create_combined_forecast_plot_ML
+from src.forecasting import evaluate_cross_validation, get_best_model_forecast, create_ml_forecast
+
+from statsforecast import StatsForecast
+from statsforecast.models import (
+    HoltWinters,
+    CrostonClassic as Croston, 
+    HistoricAverage,
+    # DynamicOptimizedTheta as DOT,
+    SeasonalNaive
+)
+from utilsforecast.losses import mse
+# from utilsforecast.evaluation import evaluate
 
 # Get the current directory
 DIRECTORY = Path(__file__).resolve().parents[0]
@@ -147,6 +158,8 @@ def create_hierarchy_filters(df: pl.DataFrame) -> dict:
     # Forecast horizon selection
     forecast_horizon = st.sidebar.slider("Forecast Horizon (months)", min_value=3, max_value=12, value=6)
     filters['horizon'] = forecast_horizon
+    forecast_confidence = st.sidebar.selectbox("Forecast Confidence Level", options=[80, 90, 95], index=1)
+    filters['confidence'] = forecast_confidence
     st.sidebar.markdown("---")
                 
     return filters
@@ -165,12 +178,17 @@ def main():
     # Create filters
     selected_filters = create_hierarchy_filters(df)
     forecast_horizon = selected_filters['horizon']
+    forecast_confidence = selected_filters['confidence']
 
     # Check if at least one filter is selected (excluding special filters)
     has_active_filters = any(
         val for key, val in selected_filters.items() 
-        if key not in ['Market_type', 'model_type', 'horizon']
+        if key not in ['Market_type', 'model_type', 'horizon', 'confidence']
     )
+    active_filters = {
+        k: v for k, v in selected_filters.items()
+        if k in df.columns and v != '' and not (k == 'Market_type' and v == 'Both')
+    }
 
     if has_active_filters:
         # Handle different visualization modes
@@ -183,11 +201,99 @@ def main():
             st.plotly_chart(fig, use_container_width=True)
 
         elif selected_filters['model_type'] == 'statsforecast':
-            fig = display_forecast_view(df, selected_filters, forecast_horizon)
+            models = [
+                HoltWinters(),
+                Croston(),
+                SeasonalNaive(season_length=12),
+                HistoricAverage(),
+                # DOT(season_length=12)
+            ]
+
+            # Instantiate StatsForecast class as sf
+            sf = StatsForecast( 
+                models=models,
+                freq='1mo', 
+                n_jobs=-1,
+                fallback_model=SeasonalNaive(season_length=12),
+                verbose=True
+            )
+
+            # Applied selected_filters on df
+            filter_expr = pl.lit(True)  # Initialiser avec une expression True pour chaîner
+            for k, v in active_filters.items():
+                filter_expr &= (pl.col(k) == v)
+            uids_column = list(active_filters.keys())[-1] if active_filters else None
+
+            # Appliquer le filtre
+            filtered_df = df.filter(filter_expr)
+            grouped_df = (
+                filtered_df.group_by(["Date", uids_column])
+                .agg(pl.col("Value").sum().alias("Value"))  # Somme des valeurs
+                .rename({uids_column: "uids"})  # Renommer la dernière clé en "uids"
+                .sort("Date")
+            )
+            grouped_df = grouped_df.rename({"Date": "ds", "uids": "unique_id", "Value": "y"})
+
+            crossvalidation_df = sf.cross_validation(
+                df=grouped_df,
+                h=forecast_horizon,
+                step_size=forecast_horizon,
+                n_windows=3
+            )
+
+            forecasts_df = sf.forecast(df=grouped_df, h=forecast_horizon, level=[forecast_confidence])
+            
+            # Evaluate the forecasts
+            evaluation_df = evaluate_cross_validation(crossvalidation_df, mse)
+
+            print(evaluation_df)
+
+            prod_forecasts_df = get_best_model_forecast(forecasts_df, evaluation_df)
+
+            fig = create_combined_forecast_plot(grouped_df, prod_forecasts_df)
             st.plotly_chart(fig, use_container_width=True)
-        # Add other visualization modes here as needed
-    else:
-        st.warning("Please select at least one hierarchy level to display data.")
+
+            with st.expander("Raw prediction data"):
+                # Display the name of the best model and the associated metric value
+                st.write("The best statistical model for this time-serie is: ", evaluation_df[0, "best_model"], " with a MSE of: ", evaluation_df[0, evaluation_df[0, "best_model"]])
+                st.write(prod_forecasts_df)
+
+        elif selected_filters['model_type'] == 'MLForecast':
+
+            grouped_df, crossvalidation_df, forecasts_df, prod_forecasts_df, evaluation_df, feature_importance = create_ml_forecast(
+                df=df,
+                active_filters=active_filters,
+                forecast_horizon=forecast_horizon,
+                forecast_confidence=forecast_confidence
+            )
+
+            print(grouped_df)
+
+            print(prod_forecasts_df)
+
+            fig = create_combined_forecast_plot_ML(grouped_df, prod_forecasts_df)
+            st.plotly_chart(fig, use_container_width=True)
+            with st.expander("Raw prediction data"):
+                best_model = evaluation_df[0, "best_model"]
+                mse_value = evaluation_df[0, best_model]
+                
+                st.write(f"The best ML model for this time-series is: {best_model}")
+                st.write(f"MSE: {mse_value:.2f}")
+                
+                # Feature importance if fcst is provided and using LightGBM
+                if fcst is not None and hasattr(fcst.models.get(best_model), 'feature_importances_'):
+                    st.write("\nFeature Importance:")
+                    importances = pd.DataFrame({
+                        'feature': fcst.feature_names,
+                        'importance': fcst.models[best_model].feature_importances_
+                    }).sort_values('importance', ascending=False)
+                    st.dataframe(importances)
+                
+                st.write("\nPredictions:")
+                st.write(prod_forecasts_df)
+
+        else:
+            st.warning("Please select at least one hierarchy level to display data.")
 
 if __name__ == "__main__":
     main()

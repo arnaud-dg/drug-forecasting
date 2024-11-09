@@ -82,8 +82,10 @@ class PlotSettings:
         )
         
         # Add vertical lines for January
-        min_year = data['Date'].dt.year.min()
-        max_year = data['Date'].dt.year.max()
+        min_date = data['Date'].min()
+        max_date = data['Date'].max()
+        min_year = min_date.year
+        max_year = max_date.year
         for year in range(min_year, max_year + 1):
             fig.add_vline(
                 x=datetime(year, 1, 1),
@@ -122,7 +124,7 @@ def generate_plot_title(filters: dict) -> str:
     
     return "Please select at least one hierarchy level"
 
-def prepare_plot_data(dataframe: pl.DataFrame, filters: dict) -> pd.DataFrame:
+def prepare_plot_data(dataframe: pl.DataFrame, filters: dict) -> pl.DataFrame:
     """
     Prepare data for plotting based on selected filters.
 
@@ -160,12 +162,7 @@ def prepare_plot_data(dataframe: pl.DataFrame, filters: dict) -> pd.DataFrame:
         .sort('Date')
     )
     
-    # Convert to pandas with proper date handling
-    pandas_df = plot_data.to_pandas()
-    pandas_df['Date'] = pandas_df['Date'].dt.to_pydatetime()
-    pandas_df['Date'] = np.array(pandas_df['Date'])
-    
-    return pandas_df
+    return plot_data
 
 def display_simple_viewer(df: pl.DataFrame, filters: dict) -> go.Figure:
     """
@@ -284,8 +281,10 @@ def create_seasonal_decomposition_plot(data: pd.DataFrame, title: str) -> go.Fig
     fig.update_yaxes(title_text="Residual", row=4, col=1)
     
     # Add vertical lines for January of each year
-    min_year = data['Date'].dt.year.min()
-    max_year = data['Date'].dt.year.max()
+    min_date = data['Date'].min()
+    max_date = data['Date'].max()
+    min_year = min_date.year
+    max_year = max_date.year
     for year in range(min_year, max_year + 1):
         for row in range(1, 5):
             fig.add_vline(
@@ -326,54 +325,257 @@ def display_seasonal_decomposition(df: pl.DataFrame, filters: dict) -> go.Figure
 #################                Statsforecast              #######################
 ###################################################################################
 
-def create_forecast_plot(forecast_data: pd.DataFrame, title: str) -> go.Figure:
+def create_combined_forecast_plot(grouped_df, prod_forecasts_df) -> go.Figure:
     """
-    Create a forecast plot with confidence intervals.
-
-    Args:
-        forecast_data (pd.DataFrame): DataFrame containing forecasts and intervals
-        title (str): Plot title
-
-    Returns:
-        go.Figure: Plotly figure object
+    Create a plotly figure combining historical and forecasted values with dynamic confidence interval detection
+    
+    Parameters:
+    -----------
+    grouped_df : polars.DataFrame
+        Historical data with columns ['ds', 'unique_id', 'y']
+    prod_forecasts_df : polars.DataFrame
+        Forecast data with dynamic confidence interval columns
     """
-    fig = px.line(
-        forecast_data, 
-        x='Date',
-        y=['Value', 'Forecast', 'Lower_CI', 'Upper_CI'],
-        title=title
+    # Detect confidence interval level
+    interval_cols = [col for col in prod_forecasts_df.columns if "-lo-" in col or "-hi-" in col]
+    if interval_cols:
+        confidence_level = interval_cols[0].split("-")[2]
+        hi_col = f"best_model-hi-{confidence_level}"
+        lo_col = f"best_model-lo-{confidence_level}"
+    else:
+        raise ValueError("No confidence interval columns found")
+    
+    # Create figure
+    fig = go.Figure()
+    
+    # Add historical values with styled markers
+    fig.add_trace(
+        go.Scatter(
+            x=grouped_df['ds'],
+            y=grouped_df['y'],
+            name="Historical values",
+            mode='lines+markers',
+            line=dict(
+                color='#3366CC',
+                width=2
+            ),
+            marker=dict(
+                size=6,
+                color='white',
+                line=dict(
+                    width=2,
+                    color='#3366CC'
+                )
+            )
+        )
     )
     
-    # Update layout with default settings
-    fig.update_layout(**PlotSettings.DEFAULT_LAYOUT)
+    # Add forecasted values with styled markers
+    fig.add_trace(
+        go.Scatter(
+            x=prod_forecasts_df['ds'],
+            y=prod_forecasts_df['best_model'],
+            name="Forecast",
+            mode='lines+markers',
+            line=dict(
+                color='#9933CC',
+                width=2
+            ),
+            marker=dict(
+                size=6,
+                color='white',
+                line=dict(
+                    width=2,
+                    color='#9933CC'
+                )
+            )
+        )
+    )
+    
+    # Add confidence interval
+    fig.add_trace(
+        go.Scatter(
+            x=prod_forecasts_df['ds'].to_list() + prod_forecasts_df['ds'].to_list()[::-1],
+            y=prod_forecasts_df[hi_col].to_list() + 
+              prod_forecasts_df[lo_col].to_list()[::-1],
+            fill='toself',
+            fillcolor='rgba(153, 51, 204, 0.2)',
+            line=dict(color='rgba(255,255,255,0)'),
+            name=f'{confidence_level}% Confidence Interval',
+            showlegend=True
+        )
+    )
+    
+    # Add vertical lines for January of each year
+    min_date = grouped_df['ds'].min()
+    max_date = prod_forecasts_df['ds'].max()
+    for year in range(min_date.year, max_date.year + 1):
+        fig.add_vline(
+            x=f"{year}-01-01",
+            line_width=1,
+            line_color='rgb(230, 230, 230)'
+        )
+    
+    # Update layout
+    fig.update_layout(
+        title=f"Sales Forecast for {grouped_df['unique_id'][0]}",
+        yaxis_title="Sales",
+        hovermode='x unified',
+        showlegend=True,
+        height=600,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.2,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=12)
+        ),
+        xaxis=dict(
+            showgrid=False,
+            dtick="M1",
+            tickangle=90,
+            tickformat='%Y-%m',
+            title=None
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor='rgb(240, 240, 240)',
+            tickformat=".2e"
+        ),
+        plot_bgcolor='white',
+        margin=dict(t=50, l=50, r=20, b=100)
+    )
     
     return fig
 
 
 
-def display_forecast_view(df: pl.DataFrame, filters: dict, forecast_horizon: int) -> go.Figure:
-    """
-    Display forecast visualization with statistics.
 
-    Args:
-        df (pl.DataFrame): Input DataFrame
-        filters (dict): Selected filters
-        forecast_horizon (int): Number of periods to forecast
+
+
+def create_combined_forecast_plot_ML(grouped_df, prod_forecasts_df):
     """
-    forecast_data = ForecastModelManager.generate_forecasts(
-        df, 
-        filters, 
-        forecast_horizon=forecast_horizon
+    Create a plotly figure combining historical and forecasted values with error handling
+    
+    Parameters:
+    -----------
+    grouped_df : polars.DataFrame
+        Historical data with columns ['ds', 'unique_id', 'y']
+    prod_forecasts_df : polars.DataFrame
+        Forecast data with confidence interval columns
+    
+    Returns:
+    --------
+    plotly.graph_objects.Figure or None
+    """
+    # Create figure
+    fig = go.Figure()
+    
+    # Add historical values with styled markers
+    fig.add_trace(
+        go.Scatter(
+            x=grouped_df['ds'],
+            y=grouped_df['y'],
+            name="Historical values",
+            mode='lines+markers',
+            line=dict(
+                color='#3366CC',
+                width=2
+            ),
+            marker=dict(
+                size=6,
+                color='white',
+                line=dict(
+                    width=2,
+                    color='#3366CC'
+                )
+            )
+        )
     )
     
-    if forecast_data is not None:
-        # Create forecast plot using the new function
-        fig = create_forecast_plot(
-            forecast_data,
-            generate_plot_title(filters)
+    # Add forecasted values with styled markers
+    fig.add_trace(
+        go.Scatter(
+            x=prod_forecasts_df['ds'],
+            y=prod_forecasts_df['best_model'],
+            name="Forecast",
+            mode='lines+markers',
+            line=dict(
+                color='#9933CC',
+                width=2
+            ),
+            marker=dict(
+                size=6,
+                color='white',
+                line=dict(
+                    width=2,
+                    color='#9933CC'
+                )
+            )
         )
+    )
+    
+    # Add confidence interval
+    interval_cols = [col for col in prod_forecasts_df.columns 
+                    if "-lo-" in col or "-hi-" in col]
+    if interval_cols:
+        confidence_level = interval_cols[0].split("-")[2]
+        hi_col = f"best_model-hi-{confidence_level}"
+        lo_col = f"best_model-lo-{confidence_level}"
         
-        return fig
-
-
-
+        fig.add_trace(
+            go.Scatter(
+                x=prod_forecasts_df['ds'].to_list() + prod_forecasts_df['ds'].to_list()[::-1],
+                y=prod_forecasts_df[hi_col].to_list() + 
+                  prod_forecasts_df[lo_col].to_list()[::-1],
+                fill='toself',
+                fillcolor='rgba(153, 51, 204, 0.2)',
+                line=dict(color='rgba(255,255,255,0)'),
+                name=f'{confidence_level}% Confidence Interval',
+                showlegend=True
+            )
+        )
+    
+    # Add vertical lines for January of each year
+    min_date = grouped_df['ds'].min()
+    max_date = prod_forecasts_df['ds'].max()
+    for year in range(min_date.year, max_date.year + 1):
+        fig.add_vline(
+            x=f"{year}-01-01",
+            line_width=1,
+            line_color='rgb(230, 230, 230)'
+        )
+    
+    # Update layout
+    fig.update_layout(
+        title=f"Sales Forecast for {grouped_df['unique_id'][0]}",
+        yaxis_title="Sales",
+        hovermode='x unified',
+        showlegend=True,
+        height=600,
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=-0.2,
+            xanchor="center",
+            x=0.5,
+            font=dict(size=12)
+        ),
+        xaxis=dict(
+            showgrid=False,
+            dtick="M1",
+            tickangle=90,
+            tickformat='%Y-%m',
+            title=None
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor='rgb(240, 240, 240)',
+            tickformat=".2e"
+        ),
+        plot_bgcolor='white',
+        margin=dict(t=50, l=50, r=20, b=100)
+    )
+    
+    return fig

@@ -13,6 +13,8 @@ Date : Nov 2024
 
 import polars as pl
 from statsforecast import StatsForecast
+from utilsforecast.losses import mse
+from utilsforecast.evaluation import evaluate
 from statsforecast.models import (
     HoltWinters,
     DynamicOptimizedTheta,
@@ -20,6 +22,18 @@ from statsforecast.models import (
     AutoARIMA
 )
 import os
+
+import lightgbm as lgb
+from mlforecast import MLForecast
+from mlforecast.lag_transforms import (
+    ExpandingMean, 
+    RollingMean,
+    ExponentiallyWeightedMean
+)
+from mlforecast.target_transforms import (
+    Differences,
+    LocalStandardScaler
+)
 
 # Enable Nixtla ID as column setting
 os.environ['NIXTLA_ID_AS_COL'] = '1'
@@ -220,3 +234,231 @@ def calculate_forecast_statistics(forecast_df: pl.DataFrame) -> dict:
         pl.col('Lower_CI').mean().alias('lower_ci_mean'),
         pl.col('Upper_CI').mean().alias('upper_ci_mean')
     ]).to_dict(as_series=False)
+
+###################################################################################
+#######################           Evaluation             ##########################
+###################################################################################
+
+def evaluate_cross_validation(df, metric):
+    models = [c for c in df.columns if c not in ('unique_id', 'ds', 'cutoff', 'y')]
+    evals = []
+    # Calculate loss for every unique_id and cutoff.    
+    for cutoff in df['cutoff'].unique():
+        eval_ = evaluate(df.filter(pl.col('cutoff') == cutoff), metrics=[metric], models=models)
+        evals.append(eval_)
+    evals = pl.concat(evals).drop('metric')
+    # Calculate the mean of each 'unique_id' group
+    evals = evals.group_by(['unique_id'], maintain_order=True).mean() 
+
+    # For each row in evals (excluding 'unique_id'), find the model with the lowest value
+    best_model = [min(row, key=row.get) for row in evals.drop('unique_id').rows(named=True)]
+
+    # Add a 'best_model' column to evals dataframe with the best model for each 'unique_id'
+    evals = evals.with_columns(pl.Series(best_model).alias('best_model')).sort(by=['unique_id'])
+    return evals
+
+def get_best_model_forecast(forecasts_df, evaluation_df):
+    """
+    Process forecast data to get best model predictions with confidence intervals
+    
+    Parameters:
+    -----------
+    forecasts_df : polars.DataFrame
+        DataFrame containing forecasts from different models
+    evaluation_df : polars.DataFrame
+        DataFrame containing evaluation results and best model selection
+        
+    Returns:
+    --------
+    polars.DataFrame
+        Processed DataFrame with best model forecasts
+    """
+    # First, detect the confidence interval level from column names
+    interval_cols = [col for col in forecasts_df.columns if "-lo-" in col or "-hi-" in col]
+    if interval_cols:
+        confidence_level = interval_cols[0].split("-")[2]
+    else:
+        raise ValueError("No confidence interval columns found")
+    
+    # Create patterns for string replacement
+    lo_pattern = f"-lo-{confidence_level}"
+    hi_pattern = f"-hi-{confidence_level}"
+    
+    # Melt the forecasts dataframe
+    df = (
+        forecasts_df
+        .melt(
+            id_vars=["unique_id", "ds"],
+            value_vars=forecasts_df.columns[2:],
+            variable_name="model",
+            value_name="best_model_forecast"
+        )
+        .join(
+            evaluation_df[['unique_id', 'best_model']],
+            on='unique_id',
+            how="left"
+        )
+    )
+    
+    # Clean up model names and filter
+    df = (
+        df
+        .with_columns(
+            pl.col('model')
+            .str.replace(f"{lo_pattern}|{hi_pattern}", "")
+            .alias("clean_model")
+        )
+        .filter(pl.col('clean_model') == pl.col('best_model'))
+        .drop('clean_model', 'best_model')
+    )
+    
+    # Rename models to best_model while preserving confidence interval suffixes
+    df = (
+        df
+        .with_columns(
+            pl.when(pl.col('model').str.contains(f"(lo|hi)-{confidence_level}$"))
+            .then(pl.concat_str([
+                pl.lit('best_model'),
+                pl.col('model').str.extract(f"(-(?:lo|hi)-{confidence_level})$")
+            ]))
+            .otherwise(pl.lit('best_model'))
+            .alias('model')
+        )
+        .pivot(
+            values='best_model_forecast',
+            index=['unique_id', 'ds'],
+            columns='model',
+            aggregate_function='first'
+        )
+        .sort(by=['unique_id', 'ds'])
+    )
+    
+    return df
+
+
+###################################################################################
+#######################           ML Forecast            ##########################
+###################################################################################
+
+def get_month_index(dates):
+    """Extract month from date column using polars"""
+    return dates.dt.month()
+
+def create_ml_forecast(df: pl.DataFrame, 
+                      active_filters: dict,
+                      forecast_horizon: int,
+                      forecast_confidence: int) -> tuple:
+    """
+    Create ML forecasts with advanced features using Polars
+    
+    Returns:
+    --------
+    tuple: (grouped_df, crossvalidation_df, forecasts_df, prod_forecasts_df, evaluation_df, feature_importance)
+    """
+    # Prepare LightGBM models with different objectives
+    lgb_params = {
+        'verbosity': -1,
+        'num_leaves': 32,
+        'learning_rate': 0.1,
+        'n_estimators': 100,
+        'force_col_wise': True
+    }
+
+    models = {
+        'avg': lgb.LGBMRegressor(**lgb_params),
+        f'q{(100-forecast_confidence)//2}': lgb.LGBMRegressor(
+            **lgb_params, 
+            objective='quantile',
+            alpha=(100-forecast_confidence)/200
+        ),
+        f'q{(100+forecast_confidence)//2}': lgb.LGBMRegressor(
+            **lgb_params, 
+            objective='quantile',
+            alpha=(100+forecast_confidence)/200
+        ),
+    }
+
+    # Prepare data with Polars
+    filter_expr = pl.lit(True)
+    for k, v in active_filters.items():
+        filter_expr &= (pl.col(k) == v)
+    uids_column = list(active_filters.keys())[-1] if active_filters else None
+
+    # Filter and group data using Polars
+    filtered_df = df.filter(filter_expr)
+    grouped_df = (
+        filtered_df.group_by(["Date", uids_column])
+        .agg(pl.col("Value").sum().alias("Value"))
+        .rename({uids_column: "unique_id"})
+        .sort("Date")
+        .with_columns([
+            pl.col("Date").dt.month().alias("month"),
+            pl.col("Date").alias("ds"),
+            pl.col("Value").alias("y")
+        ])
+        .drop("Date", "Value")
+    )
+
+    # Create MLForecast instance
+    fcst = MLForecast(
+        models=models,
+        freq='MS',
+        lags=[1, 2, 3, 6, 12],
+        lag_transforms={
+            1: [
+                ExpandingMean(),
+                ExponentiallyWeightedMean(alpha=0.7)
+            ],
+            12: [
+                RollingMean(window_size=12),
+                RollingMean(window_size=3)
+            ]
+        },
+        date_features=[get_month_index],
+        target_transforms=[
+            Differences([12]),
+            LocalStandardScaler()
+        ]
+    )
+
+    try:
+        # Convert to pandas for MLForecast
+        train_df = grouped_df.to_pandas()
+
+        # Perform cross validation
+        crossvalidation_df = fcst.cross_validation(
+            df=train_df,
+            h=forecast_horizon,
+            step_size=forecast_horizon,
+            n_windows=3
+        )
+
+        # Generate forecasts
+        fcst.fit(train_df)
+        forecasts_df = fcst.predict(forecast_horizon)
+
+        # Convert results back to polars
+        crossvalidation_df = pl.from_pandas(crossvalidation_df)
+        forecasts_df = pl.from_pandas(forecasts_df)
+
+        # Get feature importance
+        feature_importance = None
+        if hasattr(fcst.models['avg'], 'feature_importances_'):
+            feature_importance = pl.DataFrame({
+                'feature': fcst.feature_names,
+                'importance': fcst.models['avg'].feature_importances_
+            }).sort('importance', descending=True)
+
+        # Evaluate forecasts
+        evaluation_df = evaluate_cross_validation(crossvalidation_df, mse)
+        
+        # Get final forecasts with best model
+        prod_forecasts_df = get_best_model_forecast(forecasts_df, evaluation_df)
+
+        return (grouped_df, crossvalidation_df, forecasts_df, 
+                prod_forecasts_df, evaluation_df, feature_importance)
+
+    except Exception as e:
+        print(f"Error during forecasting: {str(e)}")
+        # Retourner des valeurs None pour chaque élément attendu
+        return (None, None, None, None, None, None)
