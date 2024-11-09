@@ -1,4 +1,4 @@
-data/
+data/csv files/
 data/df.csv
-data/Medic*
+*.xls
 venv_tsf/
