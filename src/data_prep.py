@@ -7,6 +7,7 @@ from tqdm import tqdm
 # Define the directory containing xls files from Medic'AM
 directory = Path(__file__).resolve().parents[1]
 data_directory = directory/'data'
+data_csv_directory = directory/'data'/'csv files'
 
 # Define an empty list to collect dataframes
 liste_dataframes = []
@@ -90,6 +91,16 @@ df_product = df_product[['CIP13', 'Designation', 'Product', 'ATC2_code', 'ATC2',
 # Capitalize the first letter of each word in the 'Product' column
 for i in ['Product', 'Designation', 'ATC2', 'ATC3', 'ATC5']:
     df_product[i] = df_product[i].str.capitalize()
+
+
+# Add the equivalence table between CIP13 and CIS
+df_equiv = pd.read_csv(str(data_csv_directory) + '/Correspondance-UCD-CIP-CIS.csv', sep=",", encoding='utf-8')
+# Merge this file with CIP_list
+df_product = pd.merge(df_product, df_equiv, how='left', on='CIP13')
+# Add the CIS dataset with vendor names
+df_cis = pd.read_csv(str(data_csv_directory) + '/CIS.csv', sep=";", encoding='utf-8')
+# Merge this file with CIP_list
+df_product = pd.merge(df_product, df_cis, how='left', on='CIS')
 
 # Save the 2 dataframes
 df_final.to_csv(str(data_directory) + '/French_pharmaceutical_sales.csv', sep=";", index=False, encoding='utf-8')

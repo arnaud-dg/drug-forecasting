@@ -351,10 +351,22 @@ def create_ml_forecast(df: pl.DataFrame,
     """
     Create ML forecasts with advanced features using Polars
     
+    Args:
+        df (pl.DataFrame): Input dataframe with columns Date, Value and filter columns
+        active_filters (dict): Dictionary of active filters to apply
+        forecast_horizon (int): Number of periods to forecast
+        forecast_confidence (int): Confidence level for predictions (e.g. 95)
+    
     Returns:
-    --------
-    tuple: (grouped_df, crossvalidation_df, forecasts_df, prod_forecasts_df, evaluation_df, feature_importance)
+        tuple: (grouped_df, forecasts_df, feature_importance)
     """
+    # Validate inputs
+    if df.height == 0:
+        raise ValueError("Input DataFrame is empty")
+        
+    if not active_filters:
+        raise ValueError("No active filters provided")
+    
     # Prepare LightGBM models with different objectives
     lgb_params = {
         'verbosity': -1,
@@ -364,6 +376,7 @@ def create_ml_forecast(df: pl.DataFrame,
         'force_col_wise': True
     }
 
+    # Create models for average and confidence intervals
     models = {
         'avg': lgb.LGBMRegressor(**lgb_params),
         f'q{(100-forecast_confidence)//2}': lgb.LGBMRegressor(
@@ -386,24 +399,32 @@ def create_ml_forecast(df: pl.DataFrame,
 
     # Filter and group data using Polars
     filtered_df = df.filter(filter_expr)
+    
+    if filtered_df.height == 0:
+        raise ValueError("No data matches the provided filters")
+
+    # Group and prepare data
     grouped_df = (
         filtered_df.group_by(["Date", uids_column])
         .agg(pl.col("Value").sum().alias("Value"))
         .rename({uids_column: "unique_id"})
         .sort("Date")
         .with_columns([
-            pl.col("Date").dt.month().alias("month"),
             pl.col("Date").alias("ds"),
             pl.col("Value").alias("y")
         ])
         .drop("Date", "Value")
     )
 
-    # Create MLForecast instance
+    # Validate minimum data requirements
+    if grouped_df.height < 24:  # At least 2 years of monthly data
+        raise ValueError(f"Not enough data points: {grouped_df.height} (minimum 24 required)")
+
+    # Create MLForecast instance with key features
     fcst = MLForecast(
         models=models,
-        freq='MS',
-        lags=[1, 2, 3, 6, 12],
+        freq='1mo',
+        lags=[1, 2, 3, 6, 12],  # Important lags for monthly data
         lag_transforms={
             1: [
                 ExpandingMean(),
@@ -414,51 +435,39 @@ def create_ml_forecast(df: pl.DataFrame,
                 RollingMean(window_size=3)
             ]
         },
-        date_features=[get_month_index],
+        date_features=['month', 'quarter'],
         target_transforms=[
-            Differences([12]),
-            LocalStandardScaler()
-        ]
+            Differences([12]),  # Remove yearly seasonality
+            LocalStandardScaler()  # Normalize data
+        ],
     )
 
     try:
-        # Convert to pandas for MLForecast
-        train_df = grouped_df.to_pandas()
+        # Fit and predict
+        fcst.fit(grouped_df)
 
-        # Perform cross validation
-        crossvalidation_df = fcst.cross_validation(
-            df=train_df,
-            h=forecast_horizon,
-            step_size=forecast_horizon,
-            n_windows=3
-        )
-
-        # Generate forecasts
-        fcst.fit(train_df)
         forecasts_df = fcst.predict(forecast_horizon)
 
-        # Convert results back to polars
-        crossvalidation_df = pl.from_pandas(crossvalidation_df)
-        forecasts_df = pl.from_pandas(forecasts_df)
+        n_windows = 1
+        h=6
 
-        # Get feature importance
-        feature_importance = None
-        if hasattr(fcst.models['avg'], 'feature_importances_'):
-            feature_importance = pl.DataFrame({
-                'feature': fcst.feature_names,
-                'importance': fcst.models['avg'].feature_importances_
-            }).sort('importance', descending=True)
+        required_training_points = h * n_windows + 2  # Minimum d'entraînement requis pour chaque fenêtre
 
-        # Evaluate forecasts
-        evaluation_df = evaluate_cross_validation(crossvalidation_df, mse)
-        
-        # Get final forecasts with best model
-        prod_forecasts_df = get_best_model_forecast(forecasts_df, evaluation_df)
+        # Vérification des dimensions pour éviter les erreurs
+        if len(grouped_df) < required_training_points:
+            raise ValueError(
+                f"Not enough data points for n_windows={n_windows} and h={h}. "
+                f"Available={len(grouped_df)}, required={required_training_points}."
+            )
 
-        return (grouped_df, crossvalidation_df, forecasts_df, 
-                prod_forecasts_df, evaluation_df, feature_importance)
+        crossvalidation_df = fcst.cross_validation(
+            df=grouped_df,
+            h=h, #min(forecast_horizon, len(grouped_df) // (n_windows + 1)),
+            step_size=forecast_horizon,
+            n_windows=min(n_windows, len(grouped_df) // forecast_horizon)
+        )
 
+        return (grouped_df, forecasts_df, crossvalidation_df)
+                
     except Exception as e:
-        print(f"Error during forecasting: {str(e)}")
-        # Retourner des valeurs None pour chaque élément attendu
-        return (None, None, None, None, None, None)
+        raise RuntimeError(f"Error during forecast generation: {str(e)}") from e

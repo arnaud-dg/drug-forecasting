@@ -451,28 +451,37 @@ def create_combined_forecast_plot(grouped_df, prod_forecasts_df) -> go.Figure:
 
 
 
-
-
-
-def create_combined_forecast_plot_ML(grouped_df, prod_forecasts_df):
+def create_combined_forecast_plot_ML(grouped_df, forecast_df, forecast_confidence):
     """
-    Create a plotly figure combining historical and forecasted values with error handling
+    Create a plotly figure combining historical and forecasted values
     
     Parameters:
     -----------
     grouped_df : polars.DataFrame
         Historical data with columns ['ds', 'unique_id', 'y']
-    prod_forecasts_df : polars.DataFrame
-        Forecast data with confidence interval columns
+    forecast_df : polars.DataFrame
+        Forecast data with columns ['ds', 'unique_id', 'avg', 'q5', 'q95']
     
     Returns:
     --------
-    plotly.graph_objects.Figure or None
+    plotly.graph_objects.Figure
     """
+    import plotly.graph_objects as go
+    
+    if forecast_confidence == 90:
+        upper_col = 'q95'
+        lower_col = 'q5'
+    elif forecast_confidence == 80:
+        upper_col = 'q90'
+        lower_col = 'q10'
+    elif forecast_confidence == 95:
+        upper_col = 'q97'
+        lower_col = 'q2'
+    
     # Create figure
     fig = go.Figure()
     
-    # Add historical values with styled markers
+    # Add historical values
     fig.add_trace(
         go.Scatter(
             x=grouped_df['ds'],
@@ -494,11 +503,11 @@ def create_combined_forecast_plot_ML(grouped_df, prod_forecasts_df):
         )
     )
     
-    # Add forecasted values with styled markers
+    # Add forecasted values
     fig.add_trace(
         go.Scatter(
-            x=prod_forecasts_df['ds'],
-            y=prod_forecasts_df['best_model'],
+            x=forecast_df['ds'],
+            y=forecast_df['avg'],
             name="Forecast",
             mode='lines+markers',
             line=dict(
@@ -517,29 +526,21 @@ def create_combined_forecast_plot_ML(grouped_df, prod_forecasts_df):
     )
     
     # Add confidence interval
-    interval_cols = [col for col in prod_forecasts_df.columns 
-                    if "-lo-" in col or "-hi-" in col]
-    if interval_cols:
-        confidence_level = interval_cols[0].split("-")[2]
-        hi_col = f"best_model-hi-{confidence_level}"
-        lo_col = f"best_model-lo-{confidence_level}"
-        
-        fig.add_trace(
-            go.Scatter(
-                x=prod_forecasts_df['ds'].to_list() + prod_forecasts_df['ds'].to_list()[::-1],
-                y=prod_forecasts_df[hi_col].to_list() + 
-                  prod_forecasts_df[lo_col].to_list()[::-1],
-                fill='toself',
-                fillcolor='rgba(153, 51, 204, 0.2)',
-                line=dict(color='rgba(255,255,255,0)'),
-                name=f'{confidence_level}% Confidence Interval',
-                showlegend=True
-            )
+    fig.add_trace(
+        go.Scatter(
+            x=forecast_df['ds'].to_list() + forecast_df['ds'].to_list()[::-1],
+            y=forecast_df[upper_col].to_list() + forecast_df[lower_col].to_list()[::-1],
+            fill='toself',
+            fillcolor='rgba(153, 51, 204, 0.2)',
+            line=dict(color='rgba(255,255,255,0)'),
+            name='90% Confidence Interval',
+            showlegend=True
         )
+    )
     
     # Add vertical lines for January of each year
     min_date = grouped_df['ds'].min()
-    max_date = prod_forecasts_df['ds'].max()
+    max_date = forecast_df['ds'].max()
     for year in range(min_date.year, max_date.year + 1):
         fig.add_vline(
             x=f"{year}-01-01",
@@ -547,9 +548,12 @@ def create_combined_forecast_plot_ML(grouped_df, prod_forecasts_df):
             line_color='rgb(230, 230, 230)'
         )
     
+    # Format title to use product name
+    product_name = grouped_df['unique_id'][0].replace('_', ' ').title()
+    
     # Update layout
     fig.update_layout(
-        title=f"Sales Forecast for {grouped_df['unique_id'][0]}",
+        title=f"Sales Forecast for {product_name}",
         yaxis_title="Sales",
         hovermode='x unified',
         showlegend=True,
@@ -564,7 +568,7 @@ def create_combined_forecast_plot_ML(grouped_df, prod_forecasts_df):
         ),
         xaxis=dict(
             showgrid=False,
-            dtick="M1",
+            dtick="M2",  # Show every 2 months
             tickangle=90,
             tickformat='%Y-%m',
             title=None
@@ -572,7 +576,7 @@ def create_combined_forecast_plot_ML(grouped_df, prod_forecasts_df):
         yaxis=dict(
             showgrid=True,
             gridcolor='rgb(240, 240, 240)',
-            tickformat=".2e"
+            tickformat=".2s"  # Use SI prefix formatting for better readability
         ),
         plot_bgcolor='white',
         margin=dict(t=50, l=50, r=20, b=100)
