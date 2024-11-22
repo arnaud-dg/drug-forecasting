@@ -19,9 +19,12 @@ from statsforecast.models import (
     HoltWinters,
     DynamicOptimizedTheta,
     SeasonalNaive,
-    AutoARIMA
+    AutoARIMA,
+    Naive,
+    ETS
 )
 import os
+import numpy as np
 
 import lightgbm as lgb
 from mlforecast import MLForecast
@@ -34,6 +37,12 @@ from mlforecast.target_transforms import (
     Differences,
     LocalStandardScaler
 )
+
+#obtain hierarchical reconciliation methods and evaluation
+from hierarchicalforecast.core import HierarchicalReconciliation
+from hierarchicalforecast.evaluation import HierarchicalEvaluation
+from hierarchicalforecast.methods import BottomUp, TopDown, MiddleOut
+from hierarchicalforecast.utils import aggregate
 
 # Enable Nixtla ID as column setting
 os.environ['NIXTLA_ID_AS_COL'] = '1'
@@ -471,3 +480,160 @@ def create_ml_forecast(df: pl.DataFrame,
                 
     except Exception as e:
         raise RuntimeError(f"Error during forecast generation: {str(e)}") from e
+    
+###################################################################################
+##################           Hierarchical Forecast            #####################
+###################################################################################
+
+def create_hierarchical_forecast(df: pl.DataFrame, active_filters: dict, 
+                               forecast_horizon: int, forecast_confidence: int):
+    """
+    Create hierarchical forecasts based on selected filter levels using Polars.
+    """
+    # Define the complete hierarchy order and spec
+    HIERARCHY_ORDER = ['ATC2', 'ATC3', 'ATC5', 'Product', 'CIP13']
+    
+    # Determine the lowest selected level
+    selected_levels = [level for level in HIERARCHY_ORDER if level in active_filters]
+    if not selected_levels:
+        raise ValueError("No hierarchy levels selected")
+    
+    # Create specification for aggregation
+    spec = []
+    for i in range(len(selected_levels)):
+        spec.append(selected_levels[:(i+1)])
+    
+    # Filter data based on active filters
+    filter_expr = pl.lit(True)
+    for k, v in active_filters.items():
+        filter_expr &= (pl.col(k) == v)
+    filtered_df = df.filter(filter_expr)
+    
+    # Prepare base DataFrame with required columns
+    base_df = (
+        filtered_df
+        .select([
+            pl.col("Date").alias("ds"),
+            pl.col("Value").alias("y"),
+            *selected_levels
+        ])
+    )
+
+    base_df_pandas = base_df.to_pandas()
+
+    print("base_df_pandas", base_df_pandas)
+
+    # Create hierarchical structure using aggregate function
+    Y_df, S_df, tags = aggregate(base_df_pandas, spec)
+    Y_df = Y_df.reset_index()
+
+    # print("Y_df", Y_df.shape)
+
+    # print("spec:", spec)
+    # print("Y_df", Y_df)
+    # print("S_df", S_df)
+    # print("tags", tags)
+    # # Save the Y_df dictionnary
+    # df_Y = pl.DataFrame(Y_df)
+    # df_Y.write_csv('Y_df.csv')
+    # # Save the S_df and tags
+    # df_S = pl.DataFrame(S_df)
+    # df_S.write_csv('S_df.csv')
+    # tags_df = pl.DataFrame(tags)
+    # tags_df.write_csv('tags.csv')
+    
+    # Split into train/test sets
+    n_test = 3
+    Y_test_df = Y_df.groupby('unique_id').tail(n_test)
+    Y_train_df = Y_df.drop(Y_test_df.index)
+    
+    Y_test_df = Y_test_df.set_index('unique_id')
+    Y_train_df = Y_train_df.set_index('unique_id')
+
+    # print("test shape", Y_test_df)
+    # print("train shape", Y_train_df)
+    
+    # Initialize StatsForecast with ETS model
+    fcst = StatsForecast(
+        df=Y_train_df,
+        models=[
+            AutoARIMA(season_length=n_test)
+        ],
+        freq='MS',
+        n_jobs=-1
+    )
+
+    print(forecast_horizon)
+    
+    # Generate base forecasts
+    Y_hat_df = fcst.forecast(h=3, fitted=True)
+    Y_fitted_df = fcst.forecast_fitted_values()
+
+    # print("Y_hat_df", Y_hat_df)
+    # print("Y_fitted_df", Y_fitted_df)
+    
+    # Define reconciliation methods
+    reconcilers = [
+        BottomUp(),
+        TopDown(method='forecast_proportions'),
+        # MiddleOut(middle_level=selected_levels[len(selected_levels)//2], top_down_method='forecast_proportions')
+    ]
+    
+    # Create reconciliation
+    hrec = HierarchicalReconciliation(reconcilers=reconcilers)
+    Y_rec_df = hrec.reconcile(
+        Y_hat_df=Y_hat_df,
+        Y_df=Y_fitted_df,
+        S=S_df,
+        tags=tags
+    )
+    
+    # print("Y_rec_df", Y_rec_df)
+
+    # Create evaluation tags for different levels
+    eval_tags = {}
+    for i, level in enumerate(selected_levels):
+        level_keys = selected_levels[:(i+1)]
+        level_tag = '/'.join(level_keys)
+        eval_tags[level] = tags[level_tag]
+    eval_tags['All'] = np.concatenate(list(tags.values()))
+
+    # print("eval_tags", eval_tags)
+    
+    # Define evaluation metrics
+    def rmse(y, y_hat):
+        return np.mean(np.sqrt(np.mean((y-y_hat)**2, axis=1)))
+    
+    def mase(y, y_hat, y_insample, seasonality=12):
+        errors = np.mean(np.abs(y - y_hat), axis=1)
+        scale = np.mean(np.abs(y_insample[:, seasonality:] - y_insample[:, :-seasonality]), axis=1)
+        return np.mean(errors / scale)
+    
+    # Perform evaluation
+    evaluator = HierarchicalEvaluation(evaluators=[rmse, mase])
+    evaluation = evaluator.evaluate(
+        Y_hat_df=Y_rec_df,
+        Y_test_df=Y_test_df,
+        tags=eval_tags,
+        Y_df=Y_train_df,
+        benchmark='AutoARIMA'
+    )
+
+    # print("evaluation", evaluation)
+    
+    # Format evaluation results
+    evaluation = evaluation.drop('Overall') if 'Overall' in evaluation.index else evaluation
+    evaluation = evaluation.round(2)
+    
+    # Prepare results summary
+    results_summary = {
+        'hierarchy_levels': selected_levels,
+        'n_series': len(Y_df['unique_id'].unique()),
+        'evaluation': evaluation
+    }
+    
+    # Convert reconciled forecasts to Polars
+    Y_rec_df = pl.from_pandas(Y_rec_df.reset_index())
+    Y_hier_df = pl.from_pandas(Y_df)
+    
+    return Y_hier_df, Y_rec_df, results_summary

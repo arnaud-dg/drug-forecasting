@@ -449,7 +449,9 @@ def create_combined_forecast_plot(grouped_df, prod_forecasts_df) -> go.Figure:
     
     return fig
 
-
+###################################################################################
+#################                 ML Forecast               #######################
+###################################################################################
 
 def create_combined_forecast_plot_ML(grouped_df, forecast_df, forecast_confidence):
     """
@@ -580,6 +582,65 @@ def create_combined_forecast_plot_ML(grouped_df, forecast_df, forecast_confidenc
         ),
         plot_bgcolor='white',
         margin=dict(t=50, l=50, r=20, b=100)
+    )
+    
+    return fig
+
+###################################################################################
+#################            Hierarchical Forecast          #######################
+###################################################################################
+
+def create_combined_forecast_plot_hierarchical(Y_hier_df, Y_rec_df, results_summary):
+    """
+    Create a plotly figure showing actual vs forecasted values for each level
+    """
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    
+    hierarchy_levels = results_summary['hierarchy_levels']
+    n_levels = len(hierarchy_levels)
+    
+    fig = make_subplots(
+        rows=n_levels,
+        cols=1,
+        subplot_titles=[f"Level: {level}" for level in hierarchy_levels],
+        vertical_spacing=0.1
+    )
+    
+    colors = px.colors.qualitative.Set1
+    
+    for i, level in enumerate(hierarchy_levels, 1):
+        level_series = Y_hier_df.filter(pl.col('unique_id').str.contains(level))
+        level_forecasts = Y_rec_df.filter(pl.col('unique_id').str.contains(level))
+        
+        # Actual values
+        fig.add_trace(
+            go.Scatter(
+                x=level_series['ds'],
+                y=level_series['y'],
+                name=f'Actual - {level}',
+                line=dict(color=colors[0]),
+                showlegend=(i==1)
+            ),
+            row=i, col=1
+        )
+        
+        # Forecasted values
+        fig.add_trace(
+            go.Scatter(
+                x=level_forecasts['ds'],
+                y=level_forecasts['AutoARIMA/BottomUp'],
+                name=f'Forecast - {level}',
+                line=dict(color=colors[1], dash='dash'),
+                showlegend=(i==1)
+            ),
+            row=i, col=1
+        )
+    
+    fig.update_layout(
+        height=300 * n_levels,
+        title_text="Hierarchical Forecasts by Level",
+        showlegend=True
     )
     
     return fig
