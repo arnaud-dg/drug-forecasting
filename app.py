@@ -34,8 +34,6 @@ from statsforecast.models import (
 from utilsforecast.losses import mse
 # from utilsforecast.evaluation import evaluate
 
-from datasetsforecast.hierarchical import HierarchicalData
-
 # compute base forecast no coherent
 from statsforecast.core import StatsForecast
 from statsforecast.models import AutoARIMA, Naive
